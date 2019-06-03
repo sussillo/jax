@@ -26,6 +26,7 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
+import collections
 import itertools
 import operator as op
 import os
@@ -952,25 +953,93 @@ def _valid_jaxtype(arg):
     return True
 
 
+class CustomTransformsFunction(object):
+  __slots__ = ["fun", "prim"]
+
+  def __init__(self, fun, prim):
+    self.fun = fun
+    self.prim = prim
+
+  def __call__(self, *args, **kwargs):
+    jax_args, in_trees = unzip2(map(pytree_to_jaxtupletree, args))
+    jax_kwargs, kwargs_tree = pytree_to_jaxtupletree(kwargs)
+    out_tree = lu.Store()
+    ans = self.prim.bind(jax_kwargs, *jax_args, kwargs_tree=kwargs_tree,
+                         in_trees=in_trees, out_tree=out_tree)
+    return build_tree(out_tree.val, ans)
+
 def custom_transforms(fun):
-  name = getattr(fun, '__name__', '<unnamed user primitive>')
+  name = getattr(fun, '__name__', '<unnamed custom_transforms primitive>')
   fun_p = core.Primitive(name)
-  fun_p.def_impl(fun)
 
-  # generic transformation implementations that rely on traceability of `fun`
-  fun_p.def_abstract_eval(partial(pe.abstract_eval_fun, fun))
-  xla.translations[fun_p] = partial(xla.lower_fun, fun)
-  ad.primitive_jvps[fun_p] = partial(jvp, fun)
-  # TODO(mattjj): batching
+  def fun_impl(jax_kwargs, *jax_args, **params):
+    args = map(build_tree, params.pop('in_trees'), jax_args)
+    kwargs = build_tree(params.pop('kwargs_tree'), jax_kwargs)
+    pytree_out = fun(*args, **kwargs)
+    out, out_tree = pytree_to_jaxtupletree(pytree_out)
+    store = params.pop('out_tree')
+    # the out_tree store may already be occupied because each transform may
+    # trace this impl (e.g. once for abstract eval and again for the default xla
+    # translation rule), but all rules populate the store in the same way
+    if store:
+      assert core.skip_checks or store.val == out_tree
+    else:
+      store.store(out_tree)
+    assert not params
+    return out
+  fun_p.def_impl(fun_impl)
+  fun_p.def_abstract_eval(partial(pe.abstract_eval_fun, fun_impl))
 
-  @wraps(fun)
-  def traceable(*args, **kwargs):
-    # TODO(mattjj): pytrees to jaxtupletrees
-    return fun_p.bind(*args, **kwargs)
-  traceable.primitive = fun_p
+  xla.translations[fun_p] = partial(xla.lower_fun, fun_impl)
 
-  return traceable
+  def fun_jvp(primals, tangents, **params):
+    return ad.jvp(lu.wrap_init(fun_impl, params)).call_wrapped(primals, tangents)
+  ad.primitive_jvps[fun_p] = fun_jvp
 
+  def fun_batch(batched_args, batch_dims, **params):
+    out = batching.batch(lu.wrap_init(fun_impl, params), batched_args, batch_dims, 0)
+    return out, 0
+  batching.primitive_batchers[fun_p] = fun_batch
+
+  return CustomTransformsFunction(fun, fun_p)
+
+def defvjp_all(fun, custom_vjp):
+  t = type(fun)
+  if t is core.Primitive:
+    ad.defvjp_all(fun, custom_vjp)
+  elif t is CustomTransformsFunction:
+    ad.defvjp_all(fun.prim, partial(_custom_transforms_vjp, custom_vjp))
+  else:
+    raise TypeError("unexpected type for defvjp_all: {}".format(t))
+
+def _custom_transforms_vjp(custom_vjp, jax_kwargs, *jax_args, **params):
+  args = map(build_tree, params.pop('in_trees'), jax_args)
+  kwargs = build_tree(params.pop('kwargs_tree'), jax_kwargs)
+  pytree_out, vjp_pytree = custom_vjp(*args, **kwargs)
+  out, out_tree = pytree_to_jaxtupletree(pytree_out)
+  store = params.pop('out_tree')
+  if store:
+    assert core.skip_checks or store.val == out_tree
+  else:
+    store.store(out_tree)
+  assert not params
+  vjp_pytree_ = lambda ct: ({},) + tuple(vjp_pytree(ct))
+  vjp, _ = pytree_fun_to_jaxtupletree_fun(lu.wrap_init(vjp_pytree_), (out_tree,))
+  return out, vjp.call_wrapped
+
+
+def jarrett(fun):
+  new_fun = custom_transforms(fun)
+
+  def elementwise_jvp(primals, tangents):
+    pushfwd = partial(jvp, fun, primals)
+    y, jacs = vmap(pushfwd, out_axes=(None, 0))(_elementwise_std_basis(tangents))
+    flat_tangents, _ = tree_flatten(tangents)
+    out_tangent = sum([t * jac for t, jac in zip(flat_tangents, jacs)])
+    return y, out_tangent
+  ad.primitive_jvps[new_fun.primitive] = elementwise_jvp
+
+  return new_fun
 
 def _elementwise_std_basis(pytree):
   leaves, _ = tree_flatten(pytree)
@@ -986,19 +1055,6 @@ def _elementwise_std_basis(pytree):
       [onp.ones(dims[j], dtype) if i == j else onp.zeros(dims[j], dtype)
        for j in range(arity)]) for i in range(arity)])
   return _unravel_array_into_pytree(pytree, 1, basis_array)
-
-def jarrett(fun):
-  new_fun = custom_transforms(fun)
-
-  def elementwise_jvp(primals, tangents):
-    pushfwd = partial(jvp, fun, primals)
-    y, jacs = vmap(pushfwd, out_axes=(None, 0))(_elementwise_std_basis(tangents))
-    flat_tangents, _ = tree_flatten(tangents)
-    out_tangent = sum([t * jac for t, jac in zip(flat_tangents, jacs)])
-    return y, out_tangent
-  ad.primitive_jvps[new_fun.primitive] = elementwise_jvp
-
-  return new_fun
 
 
 # This function mostly exists for making slides about JAX.
